@@ -25,6 +25,7 @@ from logging import getLogger
 from pathlib import Path
 from time import time
 from typing import Any, Callable, Literal, Optional, Union
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -50,7 +51,7 @@ from megatron.core.utils import unwrap_model
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.training import fault_tolerance
-from megatron.bridge.training.config import CheckpointConfig
+from megatron.bridge.training.config import CheckpointConfig, ConfigContainer
 from megatron.bridge.training.state import GlobalState, TrainState
 from megatron.bridge.training.tokenizers.config import TokenizerConfig
 from megatron.bridge.training.tokenizers.tokenizer import MegatronTokenizer
@@ -176,6 +177,102 @@ def delete_extra_state(state_dict):
         if isinstance(key, str) and "_extra_state" in key:
             del target_dict[key]
     return state_dict
+
+
+def _build_checkpoint_args(cfg: ConfigContainer, ckpt_cfg: CheckpointConfig, train_state: TrainState) -> SimpleNamespace:
+    """Construct a legacy-compatible checkpoint args namespace."""
+    model_cfg = cfg.model
+
+    dp_size = getattr(cfg, "data_parallel_size", None)
+    if dp_size is None:
+        dp_size = mpu.get_data_parallel_world_size()
+
+    tp_size = getattr(model_cfg, "tensor_model_parallel_size", 1)
+    pp_size = getattr(model_cfg, "pipeline_model_parallel_size", 1)
+    cp_size = getattr(model_cfg, "context_parallel_size", 1)
+    ep_size = getattr(model_cfg, "expert_model_parallel_size", 1)
+    vp_size = getattr(model_cfg, "virtual_pipeline_model_parallel_size", None)
+
+    world_size = tp_size * pp_size * cp_size * dp_size
+
+    bf16 = getattr(model_cfg, "bf16", False)
+    fp16 = getattr(model_cfg, "fp16", False)
+    if cfg.mixed_precision is not None:
+        mixed_cfg = cfg.mixed_precision
+        if hasattr(mixed_cfg, "bf16"):
+            bf16 = mixed_cfg.bf16
+        if hasattr(mixed_cfg, "fp16"):
+            fp16 = mixed_cfg.fp16
+
+    params_dtype = getattr(model_cfg, "params_dtype", None)
+
+    tokenizer_cfg = getattr(cfg, "tokenizer", None)
+    tokenizer_type = getattr(tokenizer_cfg, "tokenizer_type", None) if tokenizer_cfg else None
+    tokenizer_model = getattr(tokenizer_cfg, "tokenizer_model", None) if tokenizer_cfg else None
+    tiktoken_pattern = getattr(tokenizer_cfg, "tiktoken_pattern", None) if tokenizer_cfg else None
+
+    step_value = getattr(train_state, "step", 0)
+    if isinstance(step_value, torch.Tensor):
+        step_value = step_value.item()
+    step_value = int(step_value)
+
+    consumed_train = getattr(train_state, "consumed_train_samples", 0)
+    if isinstance(consumed_train, torch.Tensor):
+        consumed_train = consumed_train.item()
+
+    consumed_valid = getattr(train_state, "consumed_valid_samples", 0)
+    if isinstance(consumed_valid, torch.Tensor):
+        consumed_valid = consumed_valid.item()
+
+    skipped_train = getattr(train_state, "skipped_train_samples", 0)
+    if isinstance(skipped_train, torch.Tensor):
+        skipped_train = skipped_train.item()
+
+    args_dict: dict[str, Any] = {
+        "tensor_model_parallel_size": tp_size,
+        "pipeline_model_parallel_size": pp_size,
+        "virtual_pipeline_model_parallel_size": vp_size,
+        "num_layers_per_virtual_pipeline_stage": None,
+        "expert_model_parallel_size": ep_size,
+        "context_parallel_size": cp_size,
+        "data_parallel_size": dp_size,
+        "world_size": world_size,
+        "sequence_parallel": getattr(model_cfg, "sequence_parallel", False),
+        "num_layers": getattr(model_cfg, "num_layers", None),
+        "hidden_size": getattr(model_cfg, "hidden_size", None),
+        "ffn_hidden_size": getattr(model_cfg, "ffn_hidden_size", None),
+        "seq_length": getattr(model_cfg, "seq_length", None),
+        "num_attention_heads": getattr(model_cfg, "num_attention_heads", None),
+        "num_query_groups": getattr(model_cfg, "num_query_groups", None),
+        "kv_channels": getattr(model_cfg, "kv_channels", None),
+        "max_position_embeddings": getattr(model_cfg, "max_position_embeddings", None),
+        "position_embedding_type": getattr(model_cfg, "position_embedding_type", None),
+        "rotary_base": getattr(model_cfg, "rotary_base", None),
+        "rotary_percent": getattr(model_cfg, "rotary_percent", None),
+        "attention_dropout": getattr(model_cfg, "attention_dropout", 0.0),
+        "hidden_dropout": getattr(model_cfg, "hidden_dropout", 0.0),
+        "normalization": getattr(model_cfg, "normalization", None),
+        "swiglu": getattr(model_cfg, "swiglu", None),
+        "apply_layernorm_1p": getattr(model_cfg, "apply_layernorm_1p", False),
+        "untie_embeddings_and_output_weights": not getattr(model_cfg, "share_embeddings_and_output_weights", True),
+        "bf16": bf16,
+        "fp16": fp16,
+        "params_dtype": params_dtype,
+        "ckpt_format": ckpt_cfg.ckpt_format,
+        "tokenizer_type": tokenizer_type,
+        "tokenizer_model": tokenizer_model,
+        "tiktoken_pattern": tiktoken_pattern,
+        "iteration": step_value,
+        "consumed_train_samples": consumed_train,
+        "consumed_valid_samples": consumed_valid,
+        "skipped_train_samples": skipped_train,
+        "no_save_optim": not ckpt_cfg.save_optim,
+        "no_save_rng": not ckpt_cfg.save_rng,
+        "ckpt_fully_parallel_save": ckpt_cfg.fully_parallel_save,
+        "use_distributed_optimizer": getattr(cfg.optimizer, "use_distributed_optimizer", False),
+    }
+
+    return SimpleNamespace(**args_dict)
 
 
 def _get_checkpoint_format(checkpoint_path: str) -> str:
@@ -564,6 +661,13 @@ def save_checkpoint(
     # Apply PEFT filtering to save adapter-only checkpoints
     if cfg.peft is not None:
         state_dict = apply_peft_adapter_filter_to_state_dict(state_dict, cfg.peft)
+
+    # Inject legacy-style arguments for downstream Megatron compatibility.
+    iteration_value = getattr(train_state, "step", 0)
+    if isinstance(iteration_value, torch.Tensor):
+        iteration_value = iteration_value.item()
+    state_dict.setdefault("iteration", int(iteration_value))
+    state_dict["args"] = _build_checkpoint_args(cfg, ckpt_cfg, train_state)
 
     if ckpt_type == CheckpointType.GLOBAL:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
