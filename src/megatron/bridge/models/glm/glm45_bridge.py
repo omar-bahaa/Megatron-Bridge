@@ -16,7 +16,11 @@ import logging
 
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
-from transformers import Glm4MoeForCausalLM
+
+try:
+    from transformers import Glm4MoeForCausalLM
+except ImportError:  # pragma: no cover - optional dependency
+    Glm4MoeForCausalLM = None
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -32,7 +36,6 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 logger = logging.getLogger(__name__)
 
 
-@MegatronModelBridge.register_bridge(source=Glm4MoeForCausalLM, target=GPTModel)
 class GLM45Bridge(MegatronModelBridge):
     """
     Megatron Bridge for GLM 4.5 Models.
@@ -234,3 +237,9 @@ class GLM45Bridge(MegatronModelBridge):
             )
 
         return MegatronMappingRegistry(*mapping_list)
+
+
+if Glm4MoeForCausalLM is not None:
+    GLM45Bridge = MegatronModelBridge.register_bridge(source=Glm4MoeForCausalLM, target=GPTModel)(GLM45Bridge)
+else:  # pragma: no cover - optional dependency
+    logger.debug("transformers.Glm4MoeForCausalLM not available; skipping GLM4.5 bridge registration.")

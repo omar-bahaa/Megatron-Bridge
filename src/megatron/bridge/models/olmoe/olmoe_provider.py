@@ -13,11 +13,10 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import SelfAttention as MCoreSelfAttention
 from megatron.core.transformer.attention import SelfAttentionSubmodules
@@ -27,6 +26,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
 
+try:
+    from megatron.core.process_groups_config import ProcessGroupCollection
+except ImportError:  # pragma: no cover - compatibility fallback
+    ProcessGroupCollection = Any  # type: ignore
 
 try:
     import transformer_engine  # type: ignore  # noqa: F401
@@ -105,7 +108,7 @@ class OLMoESelfAttention(MCoreSelfAttention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         **kwargs,
     ):
         super().__init__(

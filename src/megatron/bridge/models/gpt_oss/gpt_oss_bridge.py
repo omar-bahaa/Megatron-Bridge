@@ -20,7 +20,13 @@ import torch
 import torch.nn as nn
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_model import GPTModel
-from transformers import GenerationConfig, GptOssConfig, GptOssForCausalLM
+
+try:
+    from transformers import GenerationConfig, GptOssConfig, GptOssForCausalLM
+except ImportError:  # pragma: no cover - optional dependency
+    GenerationConfig = None
+    GptOssConfig = None
+    GptOssForCausalLM = None
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
@@ -33,7 +39,9 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.utils.common_utils import extract_expert_number_from_param
 
 
-@MegatronModelBridge.register_bridge(source=GptOssForCausalLM, target=GPTModel)
+logger = logging.getLogger(__name__)
+
+
 class GPTOSSBridge(MegatronModelBridge):
     """
     Megatron Hub Bridge for GPT-OSS models.
@@ -61,11 +69,13 @@ class GPTOSSBridge(MegatronModelBridge):
 
         # Extract generation config
         generation_config = getattr(hf_pretrained, "generation_config", None)
-        if generation_config is None:
+        if generation_config is None and GenerationConfig is not None:
             try:
                 generation_config = GenerationConfig.from_pretrained(str(hf_pretrained.name_or_path))
             except Exception:
                 generation_config = None
+        elif generation_config is None:
+            generation_config = None
 
         provider = GPTOSSProvider(
             num_layers=hf_config.num_hidden_layers,
@@ -210,6 +220,10 @@ class GPTOSSBridge(MegatronModelBridge):
 
         return MegatronMappingRegistry(*mapping_list)
 
+if GptOssForCausalLM is not None:
+    GPTOSSBridge = MegatronModelBridge.register_bridge(source=GptOssForCausalLM, target=GPTModel)(GPTOSSBridge)
+else:  # pragma: no cover - optional dependency
+    logger.debug("transformers.GptOssForCausalLM not available; skipping GPT-OSS bridge registration.")
 
 class GPTOSSMLPDownProjMapping(AutoMapping):
     """
