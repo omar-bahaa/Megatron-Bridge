@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
@@ -109,16 +110,29 @@ class OLMoESelfAttention(MCoreSelfAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[Any] = None,
         **kwargs,
     ):
-        super().__init__(
-            config=config,
-            submodules=submodules,
-            layer_number=layer_number,
-            attn_mask_type=attn_mask_type,
-            cp_comm_type=cp_comm_type,
-            pg_collection=pg_collection,
-        )
+        super_signature = inspect.signature(super().__init__)
+        super_kwargs = {
+            "config": config,
+            "submodules": submodules,
+            "layer_number": layer_number,
+            "attn_mask_type": attn_mask_type,
+            "cp_comm_type": cp_comm_type,
+        }
+
+        if "model_comm_pgs" in super_signature.parameters:
+            super_kwargs["model_comm_pgs"] = model_comm_pgs if model_comm_pgs is not None else pg_collection
+        if "pg_collection" in super_signature.parameters and "pg_collection" not in super_kwargs:
+            super_kwargs["pg_collection"] = pg_collection if pg_collection is not None else model_comm_pgs
+
+        # Forward through any additional kwargs supported by upstream base class.
+        for key in list(kwargs.keys()):
+            if key in super_signature.parameters and key not in super_kwargs:
+                super_kwargs[key] = kwargs.pop(key)
+
+        super().__init__(**super_kwargs)
 
         # Unlike Mcore QK Layernorm, OlMoE layernorm has hidden_size = hidden_size_per_attention_head * num_attention_heads
         self.q_layernorm = build_module(
