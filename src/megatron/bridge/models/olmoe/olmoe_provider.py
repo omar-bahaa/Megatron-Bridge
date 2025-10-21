@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import inspect
-from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from dataclasses import dataclass, fields
+from typing import Any, Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from megatron.core import parallel_state
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import SelfAttention as MCoreSelfAttention
 from megatron.core.transformer.attention import SelfAttentionSubmodules
@@ -47,6 +48,28 @@ def olmoe_layer_spec(config: "GPTModelProvider") -> ModuleSpec:
     layer_spec = default_layer_spec(config)
     layer_spec.submodules.self_attention.module = OLMoESelfAttention
     return layer_spec
+
+
+def olmoe_transformer_layer_spec(
+    config: TransformerConfig, vp_stage: Optional[int] = None
+) -> ModuleSpec:
+    """Return the OlMoE transformer layer spec starting from a core config."""
+
+    provider_kwargs = {
+        field.name: getattr(config, field.name)
+        for field in fields(OlMoEModelProvider)
+        if field.init and hasattr(config, field.name)
+    }
+    provider = OlMoEModelProvider(**provider_kwargs)
+
+    transformer_layer_spec = provider.transformer_layer_spec
+    if isinstance(transformer_layer_spec, ModuleSpec):
+        return transformer_layer_spec
+
+    signature = inspect.signature(transformer_layer_spec)
+    if "vp_stage" in signature.parameters:
+        return transformer_layer_spec(provider, vp_stage=vp_stage)
+    return transformer_layer_spec(provider)
 
 
 @dataclass
@@ -134,22 +157,83 @@ class OLMoESelfAttention(MCoreSelfAttention):
 
         super().__init__(**super_kwargs)
 
-        # Unlike Mcore QK Layernorm, OlMoE layernorm has hidden_size = hidden_size_per_attention_head * num_attention_heads
+        # OlMoE applies Q/K layernorms across all heads in the local tensor-parallel shard.
+        hidden_size_for_norm = (
+            self.hidden_size_per_attention_head * self.num_attention_heads_per_partition
+        )
+
         self.q_layernorm = build_module(
             submodules.q_layernorm,
-            hidden_size=self.hidden_size_per_attention_head
-            * self.config.num_attention_heads,  # Main difference between Mcore QK Layernorm
+            hidden_size=hidden_size_for_norm,
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
 
         self.k_layernorm = build_module(
             submodules.k_layernorm,
-            hidden_size=self.hidden_size_per_attention_head
-            * self.config.num_attention_heads,  # Main difference between Mcore QK Layernorm
+            hidden_size=hidden_size_for_norm,
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+
+        self._register_load_state_dict_pre_hook(self._layernorm_load_state_dict_pre_hook, with_module=True)
+
+    def _layernorm_load_state_dict_pre_hook(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Slice global Q/K layernorm weights when loading checkpoints saved before TP sharding."""
+
+        def _maybe_slice(param_name):
+            key = prefix + param_name
+            if key not in state_dict:
+                return
+            tensor = state_dict[key]
+            module_attr_name, param_attr_name = param_name.split(".")
+            target_module = getattr(module, module_attr_name)
+            target_param = getattr(target_module, param_attr_name)
+            expected_shape = target_param.shape
+            if tensor.shape == expected_shape:
+                return
+            head_dim = self.hidden_size_per_attention_head
+            total_heads = self.config.num_attention_heads
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            if tp_size <= 0 or tensor.numel() != total_heads * head_dim:
+                return
+            tensor = tensor.view(total_heads, head_dim)
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            start = tp_rank * self.num_attention_heads_per_partition
+            end = start + self.num_attention_heads_per_partition
+            tensor = tensor[start:end].reshape(-1).to(dtype=target_param.dtype).clone()
+            state_dict[key] = tensor
+
+        _maybe_slice("q_layernorm.weight")
+        _maybe_slice("k_layernorm.weight")
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ):
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        for suffix in (
+            "q_layernorm.weight",
+            "k_layernorm.weight",
+        ):
+            key = f"{prefix}{suffix}"
+            if key in sharded_state_dict:
+                sharded_state_dict[key].allow_shape_mismatch = True
+
+        return sharded_state_dict
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
         """
